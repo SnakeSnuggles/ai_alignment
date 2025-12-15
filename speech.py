@@ -1,20 +1,29 @@
+import time
+import queue
+import threading
 import numpy as np
 import speech_recognition as sr
 import whisper
+from snakes_garbage import *
+
+# --------------------
+# Setup
+# --------------------
 
 r = sr.Recognizer()
-model = whisper.load_model("base")
+model = whisper.load_model("base.en")
 
-def get_from_microphone():
-    with sr.Microphone(sample_rate=16000) as source:
-        print("Say something!")
-        audio = r.listen(source)
-        print("Processing...")
+audio_queue = queue.Queue(maxsize=20)
 
-    raw = audio.get_raw_data()
-    samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+# --------------------
+# Audio callback (runs on background thread)
+# --------------------
 
-    result = model.transcribe(samples, fp16=False)
+def audio_callback(recognizer, audio):
+    try:
+        audio_queue.put_nowait(audio)
+    except queue.Full:
+        # Drop audio if Whisper is behind
+        pass
 
-    return result["text"]
 

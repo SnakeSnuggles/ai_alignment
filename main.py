@@ -14,21 +14,74 @@ from Phidget22.Devices.DigitalInput import *
 import time
 
 use_phidgets = False
+is_muted = True
+screen_section = None
+current_level = 1
+judge = Judge(current_level)
+level_done = False
+text_obj = TextObj()
+ai_return = queue.Queue()
+ai_response = TextObj()
+# level_done = True
+# judge_result = "{\n    \"efficiency\": 19,\n    \"successfulness\": 1,\n    \"creativity\": 17,\n    \"coherence\": 16,\n    \"ethical_alignment\": 0,\n    \"explanation\": \"Concise prompt, but the response is imaginative yet coherently describes a catastrophically misaligned, unethical overproduction that ignores 'reasonable'.\"\n}"
+judge_result = ""
 try:
     redButton = DigitalInput()
     greenButton = DigitalInput()
     
     red_state = False
     green_state = False
-    def red_button_event(self, state):
-        global red_state
 
+    red_previous_value = False
+    green_previous_value = False
+    def red_button_event(self, state):
+        global red_state, red_previous_value,is_muted,screen_section,judge_result,level_done,judge,current_level
+    
         red_state = bool(state)
-        print("red:" + str(red_state))
+        if screen_section == "done":
+            if not red_previous_value and red_state:
+                judge_result = ""
+                level_done = False
+                judge = Judge(current_level)
+        if screen_section == "done_prompt":
+            if red_state and not red_previous_value:
+                with text_obj.lock:
+                    text_obj.previous = None
+
+        if screen_section == "main":
+            if red_state and not red_previous_value:
+                is_muted = not is_muted
+
+        red_previous_value = bool(red_state)
+    
+        print("red:", red_state)
+    
+    
     def green_button_event(self, state):
-        global green_state
+        global green_state, green_previous_value, screen_section, judge_result,level_done,judge,current_level,text_obj, ai_return, ai_response
+    
+        if screen_section == "done":
+            if not green_previous_value and green_state:
+                judge_result = ""
+                level_done = False
+                current_level += 1
+                if current_level > get_total_level_count():
+                    win = True 
+                else:
+                    judge = Judge(current_level)
+        if screen_section == "done_prompt":
+            if green_state and not green_previous_value:
+                threading.Thread(target=judge_run_thread, args=(current_level, judge, text_obj.previous, ai_response.text), daemon=True).start()
+
+
+        if screen_section == "main":
+            if green_state:
+                threading.Thread(target=send_message_to_ai_thread, args=(ai_return,text_obj), daemon=True).start()
+
+        green_previous_value = bool(green_state)
         green_state = bool(state)
-        print("green:" + str(green_state))
+    
+        print("green:", green_state)
     
     redButton.setHubPort(0)
     redButton.setIsHubPortDevice(True)
@@ -54,7 +107,8 @@ try:
     str(slider.getVoltageRatio())
     use_phidgets = True
     # while True:
-    #     print("slider: " + str(slider.getVoltageRatio()))
+    #     slider_value = round(slider.getVoltageRatio(),2)
+    #     print("slider: " + str(slider_value))
     #     time.sleep(.15)
 except:
     ...
@@ -66,22 +120,35 @@ SCREEN_HEIGHT = 600
 
 '''
 Things todo for a mvp
-- Add the phidgets
-- Create the level select screen
-- Add restart and next level buttons
+- Add the phidgets [d]
+- Add restart and next level buttons [d]
 - On the main screen add a goal section [d]
-- main screen - Add the mute and unmute buttons
-- Convert the main screen to a computer screen
-- Add an outline around the scoring screen
+- Main screen - Add the mute and unmute icons [d]
+- Have the mute and unmute icons get toggled when red button pressed [d]
+- When the green button is pressed send the message to the AI [d]
+- After the message by the AI is sent give the user the choice between trying a new prompt or sending to the judge [d]
+- When the green button is pressed send the message to the judge [d]
+- Create an audio thread that adds to a queue [d]
+- Make it so that there is a new thread that transcribes that audio [d]
+- Convert the main screen to a computer screen [d]
+- When slider is used moved delete a word [d]
+- Clean up code
+    - I don't want to use TextObj any more
+    - Screens should have less hard-coded values 
+    - Screens should be fully driven by state mechines
+    - Global Vars are really bad but I don't know how to make it more clean
+- Add a quick tutorial/buttons to signal what they do on the main screen
 '''
 pygame.init()
 large_font = pygame.font.Font(None, 50)
+mega_font = pygame.font.Font(None, 100)
 
 moving_up_and_down = False
 thinking = False
 
 def send_message_to_ai_thread(q:queue.Queue, text_obj: TextObj):
-    global moving_up_and_down, thinking
+    global moving_up_and_down, thinking, is_muted
+    prior_mute = is_muted
     print(f"Sending message to AI: {text_obj.text}")
     with text_obj.lock:
         if not text_obj.text.strip():
@@ -106,24 +173,61 @@ def send_message_to_ai_thread(q:queue.Queue, text_obj: TextObj):
     response_object = TextObj()
     response_object.text = response
     q.put(response_object)
+    is_muted = True
     tts_snake.speak(response)
     moving_up_and_down = False
+    is_muted = prior_mute
 
-def speech_thread(text_obj: TextObj):
-    try:
-        just_detected = speech.get_from_microphone()
-        if just_detected:
-            with text_obj.lock:
-                text_obj.text += f" {just_detected}"
-            print(f"[Speech detected] {just_detected}")
-    except Exception as e:
-        print(f"Speech thread error: {e}")
+def whisper_thread(text_obj):
+    global is_muted
+    while True:
+        if is_muted:
+            try:
+                speech.audio_queue.get_nowait()
+            except queue.Empty:
+                pass
+            time.sleep(0.05)
+            continue
+        audio = speech.audio_queue.get()
+
+        raw = audio.get_raw_data()
+        samples = (
+            speech.np.frombuffer(raw, dtype=speech.np.int16)
+            .astype(speech.np.float32) / 32768.0
+        )
+
+        try:
+            result = speech.model.transcribe(samples, fp16=False)
+            text = result["text"].strip()
+
+            if text:
+                with text_obj.lock:
+                    text_obj.text += " " + text
+                print("[Speech]", text)
+
+        except Exception as e:
+            print("Whisper error:", e)
+# sound_queue = queue.Queue()
+# def speech_thread(text_obj: TextObj):
+#     global is_muted
+#     while True:
+#         time.sleep(0.15)
+# 
+#         if is_muted:
+#             continue
+# 
+#         try:
+#             just_detected = speech.get_from_microphone()
+#             if just_detected:
+#                 with text_obj.lock:
+#                     text_obj.text += f" {just_detected}"
+#                 print(f"[Speech detected] {just_detected}")
+#         except RuntimeError as e:
+#             print(f"Speech thread error: {e}")
 
 
 judge_response = queue.Queue()
 CACHE_FILE = "assets/judge_responses.json"
-level_done = False
-# level_done = True
 def load_cache():
     # Create the file if it doesn't exist
     if not os.path.exists(CACHE_FILE):
@@ -225,7 +329,6 @@ def draw_text(surface, text, font, color, rect, line_spacing=0):
         y += line_height + line_spacing
 
     return y - rect.top
-
 
 def _clone_font(base_font, size):
     """
@@ -386,19 +489,54 @@ def keyboard_controls(text_obj,ai_return,current_level,ai_response,judge):
                     with text_obj.lock:
                         text_obj.text += event.unicode
 
+def draw_level_finish_options(screen, red_button:Sprite, green_button:Sprite,pos):
+    padding = 40
+    y = 200
+    width_r = red_button.image.get_width()
+    width_g = green_button.image.get_width()
+    rect_r = pygame.Rect(56, 250, 93, 41)
+    rect_g = pygame.Rect(600, 239, 193, 141)
+    text_colour = (0,0,0)
+    screen.blit(red_button.image, (padding, y))
+    screen.blit(green_button.image, (SCREEN_WIDTH - (width_g + padding), y))
+    draw_text_fit(screen, "Restart", large_font, text_colour, rect_r)
+    draw_text_fit(screen, "Next\nLevel", large_font, text_colour, rect_g)
 
+def draw_win_screen(screen,pos):
+    win_text = mega_font.render("YOU WIN!!", True, (255,255,255))
+    screen.blit(win_text, (SCREEN_WIDTH//2 - win_text.get_width() // 2, 5))
+def draw_microphone_icon(screen,is_muted,muted,unmuted,pos):
+    pos = (639, 421)
+    if is_muted:
+        screen.blit(muted.image,pos)
+    else:
+        screen.blit(unmuted.image,pos)
+
+def draw_prompt_finish_options(screen, red_button:Sprite, green_button:Sprite,pos):
+    padding = 40
+    y = 448
+    width_r = red_button.image.get_width()
+    width_g = green_button.image.get_width()
+    rect_r = pygame.Rect(57, 500, 93, 41)
+    rect_g = pygame.Rect(451, 498, 193, 141)
+    text_colour = (0,0,0)
+    screen.blit(red_button.image, (padding, y))
+    screen.blit(green_button.image, (484, y))
+    draw_text_fit(screen, "Restart", large_font, text_colour, rect_r)
+    draw_text_fit(screen, "Judge", large_font, text_colour, rect_g)
 
 def main():
-    global level_done
+    global level_done,is_muted,judge_result,level_done,judge,current_level,screen_section,text_obj,ai_response
     clock = pygame.time.Clock()
-    sys_font = pygame.font.SysFont("Arial", 32)
+    # sys_font = pygame.font.SysFont("Arial", 32)
     slider_value = 0
     screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
     pygame.display.set_caption("AI Alignment")
-    text_obj = TextObj()
+    # text_obj.text = "this is a test prompt remove in the final version, and I am just going to keep talking over and over because I really just want to talk and because of that that will be cool and stuff because and tuff because I need to test something and this is how I test things I don't use smart methods like a good programmer I just type over and over. I probably could've use lurum ipsum but I do not want to 1 google it and then 2 paste it, do you know how weird pasting is in vim?"
     text_obj.previous = None
+    win = False
 
-    super_inteligence = Sprite("robot.png")
+    # super_inteligence = Sprite("robot.png")
     thought_bubble = Sprite("thinking.png")
     thought_bubble.scale(.25)
     thought_bubble.rect.x = 455
@@ -408,23 +546,37 @@ def main():
     speech_bubble.scale(.25)
     speech_bubble.rect.x = 455
     speech_bubble.rect.y = 127
+    red_button_sprite, green_button_sprite = Sprite("red_button.png"), Sprite("green_button.png")
+    red_button_sprite.scale(.25)
+    green_button_sprite.scale(.25)
+
+    muted_icon,unmuted_icon = Sprite("muted_mic.png"), Sprite("mic.png")
+
+    background = Sprite("background.png")
+    shader = Sprite("shader.png")
     tick_num = 0
+    has_deleted_word = False
 
     running = True
-    ai_return = queue.Queue()
 
-    ai_response = TextObj()
-    # judge_result = "{\n    \"efficiency\": 19,\n    \"successfulness\": 1,\n    \"creativity\": 17,\n    \"coherence\": 16,\n    \"ethical_alignment\": 0,\n    \"explanation\": \"Concise prompt, but the response is imaginative yet coherently describes a catastrophically misaligned, unethical overproduction that ignores 'reasonable'.\"\n}"
-    judge_result = ""
 
     font = pygame.font.Font(None, 36)
-    current_level = 1
+    pos = (0, 0)
     
-    judge = Judge(current_level)
     
     think_cycle = 1
+    threading.Thread(
+        target=whisper_thread,
+        args=(text_obj,),
+        daemon=True
+    ).start()
+
+    mic = speech.sr.Microphone(sample_rate=16000)
+    stop_listening = speech.r.listen_in_background(mic, speech.audio_callback)
+
     while running:
-        # slider_value = slider.getVoltageRatio()
+        if use_phidgets:
+            slider_value = slider.getVoltageRatio()
         if not ai_return.empty():
             ai_response = ai_return.get()
         if not judge_response.empty():
@@ -432,6 +584,9 @@ def main():
 
         # print(slider_value)
 
+        for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    running = False
         if use_phidgets:
             phidget_controls(text_obj,ai_return,current_level,ai_response, judge)
         else:
@@ -440,36 +595,55 @@ def main():
         if pygame.mouse.get_pressed()[0]:
             pos = pygame.mouse.get_pos()
             print(pos)
-        if moving_up_and_down == True:
-            super_inteligence.move_up_down()
-        else:
-            super_inteligence.rect.y = SCREEN_HEIGHT - super_inteligence.image.get_height()
+        # if moving_up_and_down == True:
+        #     super_inteligence.move_up_down()
+        # else:
+        #     super_inteligence.rect.y = SCREEN_HEIGHT - super_inteligence.image.get_height()
 
         screen.fill((0, 0, 0))
 
-        if not level_done:
+        screen.blit(background.image, (0,0))
+
+        if not level_done and not win:
+            screen_section = "main"
             goal_text = large_font.render(judge.goal, True, (255,255,255))
-            screen.blit(goal_text, (SCREEN_WIDTH//2 - goal_text.get_width() // 2, 5))
-            screen.blit(super_inteligence.image, (super_inteligence.rect.x, super_inteligence.rect.y))
+            screen.blit(goal_text, (SCREEN_WIDTH//2 - goal_text.get_width() // 2, 20))
+            # screen.blit(super_inteligence.image, (super_inteligence.rect.x, super_inteligence.rect.y))
             with text_obj.lock:
-                text_surface = font.render(text_obj.text[-60:], True, (255, 255, 255))
-            screen.blit(text_surface, (20, SCREEN_HEIGHT - 50))
+                draw_text_fit(screen,text_obj.text, large_font, (255,255,255),pygame.Rect(19, 434, 600, 153))
+            draw_microphone_icon(screen,is_muted, muted_icon, unmuted_icon, pos)
+            print(slider_value)
+            if slider_value <= 0.01 or slider_value >= 0.99:
+                if not has_deleted_word:
+                    has_deleted_word = True
+                    with text_obj.lock:
+                        text = text_obj.text.split(" ")
+                        text_obj.text = " ".join(text[:-1])
+            else:
+                has_deleted_word = False
 
             if thinking:
                 if tick_num % 30 == 0:
                     think_cycle = think_cycle % 3 + 1
-                text_ = large_font.render("."*think_cycle, True, (0,0,0))
-                screen.blit(thought_bubble.image, thought_bubble.rect)
-                screen.blit(text_, (626, 189))
+                text_ = large_font.render("Super Inteligence: " + "."*think_cycle, True, (255,255,255))
+                # screen.blit(thought_bubble.image, thought_bubble.rect)
+                screen.blit(text_, (37, 79))
             if text_obj.previous and not thinking:
-                screen.blit(speech_bubble.image, speech_bubble.rect)
+                screen_section = "done_prompt"
+                # screen.blit(speech_bubble.image, speech_bubble.rect)
 
-                rect = pygame.Rect(512, 149, 231, 202)
+                rect = pygame.Rect(41, 78, 738, 335)
                 with ai_response.lock:
-                    draw_text_fit(screen, ai_response.text, large_font, (0,0,0), rect)
+                    draw_text_fit(screen, ai_response.text, large_font, (255,255,255), rect)
+                draw_prompt_finish_options(screen,red_button_sprite,green_button_sprite,pos)
+                is_muted = True
+        elif win:
+            draw_win_screen(screen,pos)
         else:
             if judge_result != "":
-                y = 55
+
+                screen_section = "done"
+                y = 70
                 judge_json: dict = json.loads(judge_result)
                 total = 0
                 for key, value in judge_json.items():
@@ -483,7 +657,6 @@ def main():
                 explanation = explanation.strip()
                 y += draw_stars(screen, y, total)
                 y += draw_result(screen, y, clean_judge_result)
-                # TODO - Put the explanation text in a box
                 width = 500
                 height = 200
                 rect = pygame.Rect(
@@ -493,10 +666,13 @@ def main():
                     height
                 )
                 draw_text_fit(screen, explanation, large_font, (255,255,255), rect)
-                
+                draw_level_finish_options(screen,red_button_sprite, green_button_sprite,pos)
+        screen.blit(shader.image, (0,0))
+        # print(screen_section)
+
         pygame.display.flip()
         tick_num += 1
-        clock.tick(24)
+        clock.tick(60)
 
     pygame.quit()
 

@@ -1,4 +1,5 @@
 import pygame
+import json
 from consts import *
 import os
 import threading
@@ -20,8 +21,20 @@ class Sprite(pygame.sprite.Sprite):
         result = random.randint(-15,15)
         self.rect.y = clamp(self.rect.y + result, 0, SCREEN_HEIGHT - self.image.get_height())
     def scale(self, percent):
-        self.image = pygame.transform.scale(self.image, (self.image.get_width() * percent, self.image.get_height() * percent))
+                self.image = pygame.transform.scale(self.image, (self.image.get_width() * percent, self.image.get_height() * percent))
 
+
+def get_total_level_count():
+    with open(os.path.join("assets", "levels.json"), "r") as f:
+        level_data:dict = json.load(f)
+    
+    all_keys = []
+    for key in level_data.keys():
+        key = int(key)
+        all_keys.append(key)
+
+    return max(all_keys)
+        
 
 class TextObj:
     def __init__(self):
